@@ -51,8 +51,8 @@ android {
         applicationId = "com.pablom.teleprompter"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
     buildTypes {
         release {
@@ -85,11 +85,16 @@ cat > $P/app/src/main/AndroidManifest.xml <<'__EOF__'
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
     <queries>
         <package android:name="com.sec.android.app.camera" />
     </queries>
     <application
         android:allowBackup="false"
+        android:requestLegacyExternalStorage="true"
         android:icon="@drawable/ic_launcher"
         android:label="Teleprompter"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
@@ -333,6 +338,9 @@ object TpState {
     var speed: Float
         get() = p().getFloat("speed", 1f)
         set(v) { p().edit().putFloat("speed", v).apply() }
+    var rename: Boolean
+        get() = p().getBoolean("rename", true)
+        set(v) { p().edit().putBoolean("rename", v).apply() }
 
     fun save() {
         val sb = StringBuilder()
@@ -458,6 +466,127 @@ class TeleView(ctx: Context) : View(ctx) {
 }
 __EOF__
 
+cat > $J/Renamer.kt <<'__EOF__'
+package com.pablom.teleprompter
+
+import android.Manifest
+import android.content.ContentUris
+import android.content.ContentValues
+import android.content.Context
+import android.content.pm.PackageManager
+import android.media.MediaScannerConnection
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
+import java.io.File
+
+// Renombra los videos que graba la cámara mientras el teleprompter está activo:
+// "<Tema> - Tramo <n> - <Nombre del tramo> - Toma 01.mp4", "... - Toma 02.mp4", etc.
+// La numeración sigue desde la última toma que ya existe en el teléfono,
+// así que en una sesión nueva no vuelve a empezar de 1.
+object Renamer {
+    private val BAD = Regex("""[\\/:*?"<>|\u0000-\u001f]""")
+    private val SP = Regex("""\s+""")
+    private val OURS = Regex(""" - Tramo \d+ .*- Toma \d+\.[^.]+$""")
+
+    fun hasAccess(ctx: Context): Boolean =
+        if (Build.VERSION.SDK_INT >= 30) Environment.isExternalStorageManager()
+        else ctx.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+
+    fun clean(s: String): String = SP.replace(BAD.replace(s, " "), " ").trim().trim('.').trim()
+
+    fun base(tema: String, t: Tramo): String {
+        var tm = clean(tema)
+        if (tm.isEmpty()) tm = "Guion"
+        var nm = clean(t.name)
+        if (nm.length > 60) nm = nm.substring(0, 60).trim()
+        return tm + " - Tramo " + t.n + (if (nm.isNotEmpty()) " - " + nm else "") + " - Toma "
+    }
+
+    private fun nextNumber(ctx: Context, base: String): Int {
+        var mx = 0
+        val num = Regex("""^(\d+)""")
+        try {
+            ctx.contentResolver.query(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                arrayOf(MediaStore.Video.Media.DISPLAY_NAME),
+                MediaStore.Video.Media.DISPLAY_NAME + " LIKE ?",
+                arrayOf("$base%"), null
+            )?.use { c ->
+                while (c.moveToNext()) {
+                    val n = c.getString(0) ?: continue
+                    if (!n.startsWith(base)) continue
+                    val m = num.find(n.substring(base.length)) ?: continue
+                    val k = m.groupValues[1].toIntOrNull() ?: continue
+                    if (k > mx) mx = k
+                }
+            }
+        } catch (e: Exception) {}
+        // También recordamos el último número usado, para no repetir números aunque se borren tomas.
+        val k = ctx.getSharedPreferences("tp_takes", Context.MODE_PRIVATE).getInt(base, 0)
+        return maxOf(mx, k) + 1
+    }
+
+    class Found(val id: Long, val name: String, val path: String?)
+
+    // Videos nuevos desde "since" (segundos) que todavía no tienen nuestro nombre.
+    fun newVideos(ctx: Context, since: Long, done: Set<Long>): List<Found> {
+        val out = ArrayList<Found>()
+        // DURATION > 0: el video ya terminó de grabarse y la galería lo procesó.
+        var sel = MediaStore.Video.Media.DATE_ADDED + " >= ? AND " + MediaStore.Video.Media.DURATION + " > 0"
+        if (Build.VERSION.SDK_INT >= 29) sel += " AND " + MediaStore.Video.Media.IS_PENDING + " = 0"
+        try {
+            ctx.contentResolver.query(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                arrayOf(MediaStore.Video.Media._ID, MediaStore.Video.Media.DISPLAY_NAME, MediaStore.Video.Media.DATA),
+                sel, arrayOf(since.toString()),
+                MediaStore.Video.Media.DATE_ADDED + " ASC"
+            )?.use { c ->
+                while (c.moveToNext()) {
+                    val id = c.getLong(0)
+                    val name = c.getString(1) ?: continue
+                    if (id in done) continue
+                    if (OURS.containsMatchIn(name)) continue
+                    out.add(Found(id, name, c.getString(2)))
+                }
+            }
+        } catch (e: Exception) {}
+        return out
+    }
+
+    // Devuelve el nombre nuevo, o null si no se pudo.
+    fun rename(ctx: Context, f: Found, tema: String, t: Tramo): String? {
+        val dot = f.name.lastIndexOf('.')
+        val ext = if (dot >= 0) f.name.substring(dot) else ".mp4"
+        val base = base(tema, t)
+        val k = nextNumber(ctx, base)
+        val newName = base + String.format("%02d", k) + ext
+        val uri = ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, f.id)
+        var ok = false
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                val cv = ContentValues()
+                cv.put(MediaStore.Video.Media.DISPLAY_NAME, newName)
+                ok = ctx.contentResolver.update(uri, cv, null, null) > 0
+            } catch (e: Exception) {}
+        }
+        if (!ok && f.path != null) {
+            try {
+                val src = File(f.path)
+                val dst = File(src.parentFile, newName)
+                if (!dst.exists() && src.renameTo(dst)) {
+                    ok = true
+                    MediaScannerConnection.scanFile(ctx, arrayOf(src.absolutePath, dst.absolutePath), null, null)
+                }
+            } catch (e: Exception) {}
+        }
+        if (!ok) return null
+        ctx.getSharedPreferences("tp_takes", Context.MODE_PRIVATE).edit().putInt(base, k).apply()
+        return newName
+    }
+}
+__EOF__
+
 cat > $J/OverlayService.kt <<'__EOF__'
 package com.pablom.teleprompter
 
@@ -469,6 +598,12 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.database.ContentObserver
+import android.net.Uri
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Looper
+import android.provider.MediaStore
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
@@ -502,6 +637,16 @@ class OverlayService : Service() {
     private var dy0 = 0f
     private var px0 = 0
     private var py0 = 0
+
+    // Renombrado de videos
+    private val main = Handler(Looper.getMainLooper())
+    private var work: HandlerThread? = null
+    private var workH: Handler? = null
+    private var observer: ContentObserver? = null
+    private var since = 0L
+    private var playedTramo = -1
+    private val done = HashSet<Long>()
+    private val scan = Runnable { scanNow() }
 
     private val frame = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
@@ -552,6 +697,7 @@ class OverlayService : Service() {
             buildPanel()
             loadTramo(0)
             Choreographer.getInstance().postFrameCallback(frame)
+            startWatcher()
         } catch (e: Exception) {
             Toast.makeText(this, "No pude mostrar el teleprompter: " + e.message, Toast.LENGTH_LONG).show()
             stopSelf()
@@ -569,6 +715,9 @@ class OverlayService : Service() {
 
     override fun onDestroy() {
         Choreographer.getInstance().removeFrameCallback(frame)
+        main.removeCallbacks(scan)
+        observer?.let { try { contentResolver.unregisterContentObserver(it) } catch (e: Exception) {} }
+        work?.quitSafely()
         val m = wm
         if (m != null) {
             try { tele?.let { m.removeView(it) } } catch (e: Exception) {}
@@ -593,6 +742,54 @@ class OverlayService : Service() {
             startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
             startForeground(1, n)
+        }
+    }
+
+    private fun startWatcher() {
+        if (!TpState.rename) return
+        if (!Renamer.hasAccess(this)) {
+            Toast.makeText(this, "Sin permiso de archivos: los videos no se van a renombrar", Toast.LENGTH_LONG).show()
+            return
+        }
+        since = System.currentTimeMillis() / 1000L - 2L
+        val ht = HandlerThread("renamer")
+        ht.start()
+        work = ht
+        workH = Handler(ht.looper)
+        val o = object : ContentObserver(main) {
+            override fun onChange(selfChange: Boolean, uri: Uri?) {
+                main.removeCallbacks(scan)
+                main.postDelayed(scan, 1500)
+            }
+        }
+        observer = o
+        contentResolver.registerContentObserver(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, true, o)
+    }
+
+    // Se ejecuta en el hilo principal: decide a qué tramo corresponde la toma
+    // (el último que se le dio ▶, o el que está en pantalla) y renombra en segundo plano.
+    private fun scanNow() {
+        val list = TpState.tramos
+        if (list.isEmpty()) return
+        var i = if (playedTramo >= 0) playedTramo else cur
+        if (i > list.size - 1) i = list.size - 1
+        val t = list[i]
+        val tema = TpState.tema
+        val h = workH ?: return
+        h.post {
+            val found = Renamer.newVideos(this, since, done)
+            for (f in found) {
+                done.add(f.id)
+                val n = Renamer.rename(this, f, tema, t)
+                main.post {
+                    if (n != null) {
+                        playedTramo = -1
+                        Toast.makeText(this, "Guardado: " + n, Toast.LENGTH_LONG).show()
+                    } else {
+                        Toast.makeText(this, "No pude renombrar " + f.name, Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
         }
     }
 
@@ -750,6 +947,7 @@ class OverlayService : Service() {
                 pos = 0f
                 v.pos = 0f
             }
+            playedTramo = cur
             if (TpState.count > 0) {
                 countdown = TpState.count.toFloat()
                 v.countText = TpState.count.toString()
@@ -879,7 +1077,7 @@ class MainActivity : Activity() {
         root.addView(label("Cargá el guion con tramos marcados como TRAMO 1, TRAMO 2...", 14f, Color.parseColor("#AAAAAA")))
         root.addView(button("Elegir guion (.md, .txt o PDF)", "#B83A2A") { pick() })
 
-        root.addView(label("Tema (para nombrar las tomas)", 13f, Color.parseColor("#AAAAAA")))
+        root.addView(label("Nombre / tema (para nombrar los videos)", 13f, Color.parseColor("#AAAAAA")))
         temaEt = EditText(this)
         temaEt.setTextColor(Color.WHITE)
         temaEt.setText(TpState.tema)
@@ -930,6 +1128,16 @@ class MainActivity : Activity() {
         cb.isChecked = TpState.outline
         cb.setOnCheckedChangeListener { _, v -> TpState.outline = v }
         root.addView(cb)
+
+        val rn = CheckBox(this)
+        rn.text = "Renombrar cada video con el tema y el tramo (Tema - Tramo 1 - Nombre - Toma 01)"
+        rn.setTextColor(Color.WHITE)
+        rn.isChecked = TpState.rename
+        rn.setOnCheckedChangeListener { _, v ->
+            TpState.rename = v
+            if (v && !Renamer.hasAccess(this)) askFiles()
+        }
+        root.addView(rn)
 
         root.addView(button("Mostrar teleprompter", "#B83A2A") { startOverlay() })
         root.addView(button("Abrir cámara de Samsung", "#2A2A2A") { openCamera() })
@@ -1030,9 +1238,27 @@ class MainActivity : Activity() {
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2)
         }
+        if (TpState.rename && !Renamer.hasAccess(this)) {
+            askFiles()
+            return
+        }
         TpState.save()
+        stopService(Intent(this, OverlayService::class.java))
         startForegroundService(Intent(this, OverlayService::class.java))
         toast("Teleprompter activo. Ahora abrí la cámara.")
+    }
+
+    private fun askFiles() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            toast("Para renombrar los videos activá Acceso a todos los archivos para Teleprompter y volvé")
+            try {
+                startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:" + packageName)))
+            } catch (e: Exception) {
+                startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+            }
+        } else {
+            requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE, Manifest.permission.READ_EXTERNAL_STORAGE), 3)
+        }
     }
 
     private fun openCamera() {

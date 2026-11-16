@@ -430,15 +430,20 @@ function stopRec(){
   recording=false;clearInterval(recTimer);$('#rec').style.display='none';
   stopPlay();
 }
+/* numeración de tomas que sigue entre sesiones */
+function takeNum(base){try{return (JSON.parse(localStorage.getItem('tp_takes')||'{}')[base])||0}catch(e){return 0}}
+function setTakeNum(base,k){try{const o=JSON.parse(localStorage.getItem('tp_takes')||'{}');if(!(o[base]>=k)){o[base]=k;localStorage.setItem('tp_takes',JSON.stringify(o));}}catch(e){}}
 function safe(s){return s.replace(/[\\/:*?"<>|]/g,' ').replace(/\s+/g,' ').trim();}
 function onRecStop(){
   const type=(rec&&rec.mimeType)||'video/webm';
   const ext=/mp4/.test(type)?'mp4':'webm';
   const blob=new Blob(chunks,{type:type.split(';')[0]});
-  const k=(saved[cur]||0)+1;
   const tema=safe($('#tema').value)||'Guion';
-  const name=tema+' - Tramo '+tramos[cur].n+' - Toma '+k+'.'+ext;
-  pending={blob,name,idx:cur};
+  const tn=safe(tramos[cur].name||'').slice(0,60).trim();
+  const base=tema+' - Tramo '+tramos[cur].n+(tn?' - '+tn:'')+' - Toma ';
+  const k=takeNum(base)+1;
+  const name=base+String(k).padStart(2,'0')+'.'+ext;
+  pending={blob,name,idx:cur,base,k};
   if(S.review){
     $('#revt').textContent='Tramo '+tramos[cur].n+' · toma '+k;
     $('#revn').textContent=name+' · '+(blob.size/1048576).toFixed(1)+' MB';
@@ -455,6 +460,7 @@ function saveTake(next){
   a.href=URL.createObjectURL(pending.blob);a.download=pending.name;
   document.body.appendChild(a);a.click();a.remove();
   saved[pending.idx]=(saved[pending.idx]||0)+1;
+  setTakeNum(pending.base,pending.k);
   const idx=pending.idx;pending=null;
   closeRev();
   if(next&&idx+1<tramos.length)loadTramo(idx+1);else{loadTramo(idx);}
