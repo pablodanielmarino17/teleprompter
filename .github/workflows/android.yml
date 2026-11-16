@@ -40,8 +40,14 @@ jobs:
           date -u >> dist/STATUS.txt
           grep -nE "^e: |error:|FAILED|What went wrong|Could not" -A4 build.log | head -120 > dist/ERRORS.txt || true
           tail -n 80 build.log > dist/LOG_TAIL.txt || true
+          echo "===== RESULTADO ====="; cat dist/STATUS.txt; cat dist/ERRORS.txt
           git config user.name "github-actions"
           git config user.email "actions@users.noreply.github.com"
           git add dist
           git commit -m "Resultado de la compilacion" || true
           git push || true
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: teleprompter-apk
+          path: android/dist/
